@@ -1,25 +1,51 @@
 import runpod
 import torch
 import torchaudio as ta
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 import base64
 import io
-import os
-import tempfile
+import numpy as np
 
-print("Starting FlashTTS Worker...")
+print("Starting FlashTTS Worker (Kokoro)...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
 
-print("Loading Chatterbox Multilingual model...")
-model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-print("Model loaded successfully! Worker ready.")
+print("Loading Kokoro model...")
+from kokoro import KPipeline
+pipeline = KPipeline(lang_code='a', device=device)
+print("Kokoro model loaded! Worker ready.")
+
+LANG_MAP = {
+    "en": "a",
+    "en-gb": "b",
+    "ja": "j",
+    "ko": "k",
+    "zh": "z",
+    "fr": "f",
+    "es": "e",
+    "pt": "p",
+    "hi": "h",
+    "it": "i",
+    "de": "d",
+}
+
+DEFAULT_VOICES = {
+    "a": "af_heart",
+    "b": "bf_emma",
+    "j": "jf_alpha",
+    "k": "kf_alpha",
+    "z": "zf_xiaobei",
+    "f": "ff_siwis",
+    "e": "ef_dora",
+    "p": "pf_dora",
+    "h": "hf_alpha",
+    "i": "if_sara",
+    "d": "df_hedda",
+}
 
 def handler(job):
     try:
         job_input = job.get("input", {})
 
-        # Validation
         text = job_input.get("text", "").strip()
         if not text:
             return {"error": "text is required"}
@@ -27,59 +53,51 @@ def handler(job):
             return {"error": "text too long, max 20000 characters"}
 
         language_id = job_input.get("language_id", "en")
-        exaggeration = float(job_input.get("exaggeration", 0.5))
-        cfg_weight = float(job_input.get("cfg_weight", 0.5))
+        voice = job_input.get("voice", None)
+        speed = float(job_input.get("speed", 1.0))
+        speed = max(0.5, min(2.0, speed))
 
-        # Clamp values
-        exaggeration = max(0.0, min(1.0, exaggeration))
-        cfg_weight = max(0.0, min(1.0, cfg_weight))
+        lang_code = LANG_MAP.get(language_id, "a")
+        if not voice:
+            voice = DEFAULT_VOICES.get(lang_code, "af_heart")
 
-        reference_audio_b64 = job_input.get("reference_audio_b64", None)
-        audio_prompt_path = None
+        print(f"Generating: lang={language_id}, voice={voice}, chars={len(text)}, speed={speed}")
 
-        # Handle voice cloning audio
-        if reference_audio_b64:
-            try:
-                audio_bytes = base64.b64decode(reference_audio_b64)
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp.write(audio_bytes)
-                tmp.close()
-                audio_prompt_path = tmp.name
-                print(f"Reference audio saved: {audio_prompt_path}")
-            except Exception as e:
-                return {"error": f"Invalid reference audio: {str(e)}"}
-
-        print(f"Generating: lang={language_id}, chars={len(text)}, clone={audio_prompt_path is not None}")
-
-        wav = model.generate(
+        audio_chunks = []
+        generator = pipeline(
             text,
-            language_id=language_id,
-            audio_prompt_path=audio_prompt_path,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight,
+            voice=voice,
+            speed=speed,
+            split_pattern=r'\n+'
         )
 
+        for _, _, audio in generator:
+            if audio is not None:
+                audio_chunks.append(audio)
+
+        if not audio_chunks:
+            return {"error": "No audio generated"}
+
+        final_audio = np.concatenate(audio_chunks)
+        audio_tensor = torch.from_numpy(final_audio).unsqueeze(0)
+
         buffer = io.BytesIO()
-        ta.save(buffer, wav, model.sr, format="wav")
+        ta.save(buffer, audio_tensor, 24000, format="wav")
         buffer.seek(0)
         audio_b64 = base64.b64encode(buffer.read()).decode("utf-8")
 
-        print(f"Generation complete! Sample rate: {model.sr}")
+        print(f"Done! chars={len(text)}")
 
         return {
             "audio_base64": audio_b64,
-            "sample_rate": model.sr,
+            "sample_rate": 24000,
             "language": language_id,
+            "voice": voice,
             "characters": len(text),
         }
 
     except Exception as e:
-        print(f"Handler error: {str(e)}")
+        print(f"Error: {str(e)}")
         return {"error": str(e)}
-
-    finally:
-        if audio_prompt_path and os.path.exists(audio_prompt_path):
-            os.unlink(audio_prompt_path)
-            print("Temp file cleaned up")
 
 runpod.serverless.start({"handler": handler})
