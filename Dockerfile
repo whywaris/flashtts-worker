@@ -19,4 +19,12 @@ RUN pip3 install --no-deps \
 
 COPY handler.py .
 
+# ✅ Yeh line model ko BUILD TIME pe download karegi
+# Cold start pe sirf load hoga — download nahi hoga
+RUN python3 -c "\
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS; \
+import torch; \
+model = ChatterboxMultilingualTTS.from_pretrained(device='cpu'); \
+print('Model pre-downloaded successfully!')"
+
 CMD ["python3", "handler.py"]
