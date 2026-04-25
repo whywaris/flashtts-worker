@@ -3,49 +3,27 @@ import torch
 import torchaudio as ta
 import base64
 import io
+import os
+import tempfile
 import numpy as np
 
-print("Starting FlashTTS Worker (Kokoro)...")
+print("Starting FlashTTS Worker (Qwen3-TTS)...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
 
-print("Loading Kokoro model...")
-from kokoro import KPipeline
-pipeline = KPipeline(lang_code='a', device=device)
-print("Kokoro model loaded! Worker ready.")
+print("Loading Qwen3-TTS model...")
+from transformers import AutoTokenizer
+from qwen3_tts import Qwen3TTS
 
-LANG_MAP = {
-    "en": "a",
-    "en-gb": "b",
-    "ja": "j",
-    "ko": "k",
-    "zh": "z",
-    "fr": "f",
-    "es": "e",
-    "pt": "p",
-    "hi": "h",
-    "it": "i",
-    "de": "d",
-}
-
-DEFAULT_VOICES = {
-    "a": "af_heart",
-    "b": "bf_emma",
-    "j": "jf_alpha",
-    "k": "kf_alpha",
-    "z": "zf_xiaobei",
-    "f": "ff_siwis",
-    "e": "ef_dora",
-    "p": "pf_dora",
-    "h": "hf_alpha",
-    "i": "if_sara",
-    "d": "df_hedda",
-}
+model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+tts = Qwen3TTS.from_pretrained(model_name, device=device)
+print("Qwen3-TTS model loaded! Worker ready.")
 
 def handler(job):
     try:
         job_input = job.get("input", {})
 
+        # Validation
         text = job_input.get("text", "").strip()
         if not text:
             return {"error": "text is required"}
@@ -53,33 +31,60 @@ def handler(job):
             return {"error": "text too long, max 20000 characters"}
 
         language_id = job_input.get("language_id", "en")
-        voice = job_input.get("voice", None)
         speed = float(job_input.get("speed", 1.0))
         speed = max(0.5, min(2.0, speed))
 
-        lang_code = LANG_MAP.get(language_id, "a")
-        if not voice:
-            voice = DEFAULT_VOICES.get(lang_code, "af_heart")
+        # Voice cloning — base64 audio
+        reference_audio_b64 = job_input.get("reference_audio_b64", None)
+        reference_audio_url = job_input.get("reference_audio_url", None)
+        audio_prompt_path = None
 
-        print(f"Generating: lang={language_id}, voice={voice}, chars={len(text)}, speed={speed}")
+        # Handle base64 reference audio
+        if reference_audio_b64:
+            try:
+                audio_bytes = base64.b64decode(reference_audio_b64)
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.write(audio_bytes)
+                tmp.close()
+                audio_prompt_path = tmp.name
+                print(f"Reference audio from base64 saved: {audio_prompt_path}")
+            except Exception as e:
+                return {"error": f"Invalid reference audio: {str(e)}"}
 
-        audio_chunks = []
-        generator = pipeline(
-            text,
-            voice=voice,
-            speed=speed,
-            split_pattern=r'\n+'
-        )
+        # Handle URL reference audio
+        elif reference_audio_url:
+            try:
+                import urllib.request
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                urllib.request.urlretrieve(reference_audio_url, tmp.name)
+                tmp.close()
+                audio_prompt_path = tmp.name
+                print(f"Reference audio from URL saved: {audio_prompt_path}")
+            except Exception as e:
+                return {"error": f"Failed to download reference audio: {str(e)}"}
 
-        for _, _, audio in generator:
-            if audio is not None:
-                audio_chunks.append(audio)
+        print(f"Generating: lang={language_id}, chars={len(text)}, clone={audio_prompt_path is not None}")
 
-        if not audio_chunks:
-            return {"error": "No audio generated"}
+        # Generate audio
+        if audio_prompt_path:
+            # Voice cloning mode
+            wav = tts.generate(
+                text=text,
+                reference_audio=audio_prompt_path,
+                speed=speed,
+            )
+        else:
+            # Standard TTS mode
+            wav = tts.generate(
+                text=text,
+                speed=speed,
+            )
 
-        final_audio = np.concatenate(audio_chunks)
-        audio_tensor = torch.from_numpy(final_audio).unsqueeze(0)
+        # Convert to base64
+        if isinstance(wav, np.ndarray):
+            audio_tensor = torch.from_numpy(wav).unsqueeze(0)
+        else:
+            audio_tensor = wav
 
         buffer = io.BytesIO()
         ta.save(buffer, audio_tensor, 24000, format="wav")
@@ -92,12 +97,16 @@ def handler(job):
             "audio_base64": audio_b64,
             "sample_rate": 24000,
             "language": language_id,
-            "voice": voice,
             "characters": len(text),
         }
 
     except Exception as e:
         print(f"Error: {str(e)}")
         return {"error": str(e)}
+
+    finally:
+        if audio_prompt_path and os.path.exists(audio_prompt_path):
+            os.unlink(audio_prompt_path)
+            print("Temp file cleaned up")
 
 runpod.serverless.start({"handler": handler})
