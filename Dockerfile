@@ -21,7 +21,8 @@ RUN pip3 install --no-cache-dir \
     accelerate \
     huggingface_hub
 
-RUN pip3 install --no-cache-dir qwen3-tts
+RUN pip3 install --no-cache-dir \
+    git+https://github.com/QwenLM/Qwen3-TTS.git
 
 COPY handler.py .
 
