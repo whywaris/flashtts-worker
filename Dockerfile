@@ -22,23 +22,22 @@ RUN pip install --upgrade pip && \
     torch==2.3.0 torchaudio==2.3.0 \
     --extra-index-url https://download.pytorch.org/whl/cu121
 
-# ─── Step 2: RunPod + core deps ───────────────────────────────────────────────
+# ─── Step 2: Chatterbox FIRST (it pins numpy internally) ──────────────────────
+RUN pip install --no-cache-dir chatterbox-tts
+
+# ─── Step 3: RunPod + remaining deps (no numpy pin — let chatterbox decide) ───
 RUN pip install --no-cache-dir \
     runpod>=1.7.0 \
-    numpy==1.26.0 \
     scipy \
     soundfile \
     huggingface_hub
 
-# ─── Step 3: Install chatterbox from pip ──────────────────────────────────────
-RUN pip install --no-cache-dir chatterbox-tts
-
-# ─── Step 4: Clone full HF Space (includes multilingual src) ──────────────────
+# ─── Step 4: Clone full HF Space (multilingual src) ──────────────────────────
 RUN git clone https://huggingface.co/spaces/ResembleAI/Chatterbox-Multilingual-TTS /app/space && \
     echo "=== Space files ===" && \
     find /app/space -name "*.py" | sort
 
-# ─── Step 5: Install space requirements if any ────────────────────────────────
+# ─── Step 5: Install space requirements ───────────────────────────────────────
 RUN if [ -f /app/space/requirements.txt ]; then \
         pip install --no-cache-dir -r /app/space/requirements.txt || true; \
     fi
