@@ -4,59 +4,74 @@ import io
 import base64
 import traceback
 
+# ─── Path setup — add space to import path ────────────────────────────────────
+SPACE_DIR = "/app/space"
+sys.path.insert(0, SPACE_DIR)
+sys.path.insert(0, "/app")
+
+# ─── Cache dir setup BEFORE any model imports ─────────────────────────────────
+CACHE_DIR = "/runpod-volume/hf_cache" if os.path.exists("/runpod-volume") else "/app/hf_cache"
+os.environ["HF_HOME"] = CACHE_DIR
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 import runpod
 import numpy as np
 import torch
 import scipy.io.wavfile as wav_writer
 
-# Add /app to path so `src` package is importable
-sys.path.insert(0, "/app")
-
-from src.chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
-
 # ─── Device ───────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[FlashTTS] Running on: {DEVICE}")
+print(f"[FlashTTS] Device: {DEVICE}")
+print(f"[FlashTTS] Cache: {CACHE_DIR}")
+print(f"[FlashTTS] Python path: {sys.path[:3]}")
 
-# ─── Cache dir — use RunPod Network Volume if mounted, else local ─────────────
-CACHE_DIR = "/runpod-volume/hf_cache" if os.path.exists("/runpod-volume") else "/app/hf_cache"
-os.environ["HF_HOME"] = CACHE_DIR
-os.makedirs(CACHE_DIR, exist_ok=True)
-print(f"[FlashTTS] Model cache dir: {CACHE_DIR}")
+# ─── Auto-detect which TTS class to use ───────────────────────────────────────
+MODEL = None
+SUPPORTED_LANGUAGES = {"en": "English"}
+USE_MULTILINGUAL = False
 
-# ─── Load model ONCE at worker startup (global scope) ─────────────────────────
-# Model is already baked into Docker image — no download needed
-print("[FlashTTS] Loading ChatterboxMultilingualTTS model...")
-try:
-    MODEL = ChatterboxMultilingualTTS.from_pretrained(DEVICE)
-    print(f"[FlashTTS] Model loaded. Supported languages: {list(SUPPORTED_LANGUAGES.keys())}")
-except Exception as e:
-    print(f"[FlashTTS] CRITICAL: Model failed to load — {e}")
-    MODEL = None
+def load_model():
+    global MODEL, SUPPORTED_LANGUAGES, USE_MULTILINGUAL
 
+    # Try multilingual first
+    try:
+        print("[FlashTTS] Trying ChatterboxMultilingualTTS...")
+        # Check what files exist in space
+        for root, dirs, files in os.walk(SPACE_DIR):
+            for f in files:
+                if f.endswith('.py'):
+                    print(f"  Found: {os.path.join(root, f)}")
 
-# ─── Input validation ─────────────────────────────────────────────────────────
-def validate_input(job_input: dict) -> tuple[str | None, str]:
-    """Returns (error_message, "") or (None, validated_text)"""
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES as LANGS
+        MODEL = ChatterboxMultilingualTTS.from_pretrained(DEVICE)
+        SUPPORTED_LANGUAGES = LANGS
+        USE_MULTILINGUAL = True
+        print(f"[FlashTTS] Multilingual model loaded! Languages: {list(LANGS.keys())}")
+        return
+    except Exception as e:
+        print(f"[FlashTTS] Multilingual failed: {e}")
 
-    text = job_input.get("text", "").strip()
-    if not text:
-        return "Missing required field: 'text'", ""
-    if len(text) > 3000:
-        return f"Text too long ({len(text)} chars). Max is 3000.", ""
+    # Fallback to standard Chatterbox
+    try:
+        print("[FlashTTS] Falling back to standard ChatterboxTTS...")
+        from chatterbox.tts import ChatterboxTTS
+        MODEL = ChatterboxTTS.from_pretrained(DEVICE)
+        USE_MULTILINGUAL = False
+        print("[FlashTTS] Standard Chatterbox loaded!")
+        return
+    except Exception as e:
+        print(f"[FlashTTS] Standard also failed: {e}")
+        print(traceback.format_exc())
 
-    lang = job_input.get("language_id", "en")
-    if lang not in SUPPORTED_LANGUAGES:
-        supported = ", ".join(sorted(SUPPORTED_LANGUAGES.keys()))
-        return f"Unsupported language '{lang}'. Supported: {supported}", ""
+print("[FlashTTS] Loading model...")
+load_model()
 
-    return None, text
+if MODEL is None:
+    print("[FlashTTS] CRITICAL: No model loaded!")
 
 
 # ─── Audio encoding ───────────────────────────────────────────────────────────
 def wav_to_base64(sample_rate: int, audio_np: np.ndarray) -> str:
-    """Convert numpy audio array to base64-encoded WAV string."""
-    # Normalize to int16
     audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     wav_writer.write(buf, sample_rate, audio_int16)
@@ -64,136 +79,109 @@ def wav_to_base64(sample_rate: int, audio_np: np.ndarray) -> str:
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
+# ─── Text chunking ────────────────────────────────────────────────────────────
+def chunk_text(text: str, max_chars: int = 280) -> list:
+    if len(text) <= max_chars:
+        return [text]
+    import re
+    sentences = re.split(r'(?<=[.!?।۔])\s+', text)
+    chunks, current = [], ""
+    for s in sentences:
+        if len(current) + len(s) + 1 <= max_chars:
+            current = (current + " " + s).strip()
+        else:
+            if current:
+                chunks.append(current)
+            current = s if len(s) <= max_chars else ""
+            if len(s) > max_chars:
+                for i in range(0, len(s), max_chars):
+                    chunks.append(s[i:i+max_chars])
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
 # ─── Handler ──────────────────────────────────────────────────────────────────
 def handler(job: dict) -> dict:
-    """
-    RunPod handler. Accepts job input and returns generated audio.
-
-    Input schema:
-    {
-        "text": str,                        # required — text to synthesize (max 3000 chars)
-        "language_id": str,                 # optional — language code e.g. "en", "ar", "hi" (default: "en")
-        "audio_prompt_base64": str,         # optional — reference voice as base64 WAV/FLAC
-        "exaggeration": float,              # optional — 0.25–2.0 (default: 0.5)
-        "temperature": float,               # optional — 0.05–5.0 (default: 0.8)
-        "cfg_weight": float,                # optional — 0.2–1.0 (default: 0.5)
-        "seed": int                         # optional — 0 = random (default: 0)
-    }
-
-    Output schema:
-    {
-        "audio_base64": str,    # base64-encoded WAV
-        "sample_rate": int,
-        "language": str,
-        "characters_processed": int
-    }
-    """
     if MODEL is None:
-        return {"error": "Model not loaded. Check worker logs."}
+        return {"error": "Model not loaded. Check worker logs for details."}
 
     job_input = job.get("input", {})
+    text = job_input.get("text", "").strip()
 
-    # Validate
-    error, _ = validate_input(job_input)
-    if error:
-        return {"error": error}
+    if not text:
+        return {"error": "Missing required field: 'text'"}
+    if len(text) > 3000:
+        return {"error": f"Text too long ({len(text)} chars). Max 3000."}
 
-    text        = job_input["text"].strip()
-    language_id = job_input.get("language_id", "en")
+    language_id  = job_input.get("language_id", "en")
     exaggeration = float(job_input.get("exaggeration", 0.5))
     temperature  = float(job_input.get("temperature", 0.8))
     cfg_weight   = float(job_input.get("cfg_weight", 0.5))
     seed         = int(job_input.get("seed", 0))
 
-    # Seed
     if seed != 0:
         torch.manual_seed(seed)
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
-        np.random.seed(seed)
 
-    # Handle optional reference audio
+    # Reference audio
     audio_prompt_path = None
-    audio_prompt_b64 = job_input.get("audio_prompt_base64")
-    if audio_prompt_b64:
+    if job_input.get("audio_prompt_base64"):
         try:
-            tmp_path = "/tmp/ref_audio.wav"
-            with open(tmp_path, "wb") as f:
-                f.write(base64.b64decode(audio_prompt_b64))
-            audio_prompt_path = tmp_path
-            print(f"[FlashTTS] Reference audio saved to {tmp_path}")
+            tmp = "/tmp/ref_audio.wav"
+            with open(tmp, "wb") as f:
+                f.write(base64.b64decode(job_input["audio_prompt_base64"]))
+            audio_prompt_path = tmp
         except Exception as e:
-            print(f"[FlashTTS] Warning: Could not decode audio_prompt_base64 — {e}")
+            print(f"[FlashTTS] ref audio decode failed: {e}")
 
-    # Chunk long text (model handles max ~300 chars well per chunk)
-    chunks = _chunk_text(text, max_chars=280)
-    print(f"[FlashTTS] Generating {len(chunks)} chunk(s) | lang={language_id} | chars={len(text)}")
+    chunks = chunk_text(text)
+    print(f"[FlashTTS] Generating {len(chunks)} chunk(s) | lang={language_id}")
 
     try:
         all_audio = []
         for i, chunk in enumerate(chunks):
-            print(f"[FlashTTS] Chunk {i+1}/{len(chunks)}: '{chunk[:60]}...'")
+            print(f"[FlashTTS] Chunk {i+1}/{len(chunks)}")
 
-            generate_kwargs = {
-                "language_id": language_id,
-                "exaggeration": exaggeration,
-                "temperature": temperature,
-                "cfg_weight": cfg_weight,
-            }
-            if audio_prompt_path:
-                generate_kwargs["audio_prompt_path"] = audio_prompt_path
+            if USE_MULTILINGUAL:
+                kwargs = {
+                    "language_id": language_id,
+                    "exaggeration": exaggeration,
+                    "temperature": temperature,
+                    "cfg_weight": cfg_weight,
+                }
+                if audio_prompt_path:
+                    kwargs["audio_prompt_path"] = audio_prompt_path
+                wav = MODEL.generate(chunk, **kwargs)
+            else:
+                # Standard chatterbox (English only)
+                kwargs = {
+                    "exaggeration": exaggeration,
+                    "temperature": temperature,
+                    "cfg_weight": cfg_weight,
+                }
+                if audio_prompt_path:
+                    kwargs["audio_prompt_path"] = audio_prompt_path
+                wav = MODEL.generate(chunk, **kwargs)
 
-            wav = MODEL.generate(chunk, **generate_kwargs)
             all_audio.append(wav.squeeze(0).numpy())
 
-        # Concatenate chunks
         final_audio = np.concatenate(all_audio, axis=0)
-        sample_rate = MODEL.sr
-
-        audio_b64 = wav_to_base64(sample_rate, final_audio)
-        print(f"[FlashTTS] Generation complete. Sample rate: {sample_rate}")
+        audio_b64 = wav_to_base64(MODEL.sr, final_audio)
 
         return {
             "audio_base64": audio_b64,
-            "sample_rate": sample_rate,
+            "sample_rate": MODEL.sr,
             "language": language_id,
+            "multilingual": USE_MULTILINGUAL,
             "characters_processed": len(text)
         }
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[FlashTTS] ERROR during generation:\n{tb}")
+        print(f"[FlashTTS] Generation error:\n{tb}")
         return {"error": str(e), "traceback": tb}
-
-
-def _chunk_text(text: str, max_chars: int = 280) -> list[str]:
-    """Split text into chunks at sentence boundaries."""
-    if len(text) <= max_chars:
-        return [text]
-
-    import re
-    # Split on sentence-ending punctuation
-    sentences = re.split(r'(?<=[.!?।۔])\s+', text)
-    chunks = []
-    current = ""
-
-    for sentence in sentences:
-        if len(current) + len(sentence) + 1 <= max_chars:
-            current = (current + " " + sentence).strip()
-        else:
-            if current:
-                chunks.append(current)
-            # If single sentence is too long, hard-split it
-            if len(sentence) > max_chars:
-                for i in range(0, len(sentence), max_chars):
-                    chunks.append(sentence[i:i+max_chars])
-            else:
-                current = sentence
-
-    if current:
-        chunks.append(current)
-
-    return chunks
 
 
 # ─── Start ────────────────────────────────────────────────────────────────────
