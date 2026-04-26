@@ -56,15 +56,6 @@ RUN git clone https://huggingface.co/spaces/ResembleAI/Chatterbox-Multilingual-T
     cp -r /tmp/cb_space/src /app/src && \
     rm -rf /tmp/cb_space
 
-# ─── Step 6: Pre-bake model weights ──────────────────────────────────────────
-RUN python -c "\
-import sys; sys.path.insert(0, '/app'); \
-from src.chatterbox.mtl_tts import ChatterboxMultilingualTTS; \
-print('Downloading model weights...'); \
-model = ChatterboxMultilingualTTS.from_pretrained('cpu'); \
-print('Done!'); \
-del model"
-
 # ─── Copy handler ─────────────────────────────────────────────────────────────
 COPY handler.py .
 
