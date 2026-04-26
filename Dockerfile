@@ -1,29 +1,44 @@
+# ─── Base: CUDA 12.1 + Python 3.11 ───────────────────────────────────────────
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV HF_HOME=/workspace/huggingface
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/app/hf_cache \
+    TORCH_HOME=/app/torch_cache
 
-RUN apt-get update && apt-get install -y \
-    python3.11 python3-pip git ffmpeg \
+# ─── System deps ──────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3-pip \
+    git ffmpeg libsndfile1 curl \
     && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/pip3 /usr/bin/pip
 
 WORKDIR /app
 
-RUN pip3 install --no-cache-dir \
-    torch==2.3.1 torchaudio==2.3.1 \
-    --index-url https://download.pytorch.org/whl/cu121
+# ─── Python deps ──────────────────────────────────────────────────────────────
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-RUN pip3 install --no-cache-dir runpod numpy
+# ─── Clone HF Space source (contains ChatterboxMultilingualTTS class) ─────────
+RUN git clone https://huggingface.co/spaces/ResembleAI/Chatterbox-Multilingual-TTS /tmp/chatterbox_space && \
+    cp -r /tmp/chatterbox_space/src /app/src && \
+    rm -rf /tmp/chatterbox_space
 
-RUN pip3 install --no-cache-dir \
-    transformers \
-    accelerate \
-    huggingface_hub
+# ─── Pre-download model weights at BUILD TIME (baked into image) ──────────────
+# This eliminates cold-start model download entirely
+RUN python -c "\
+import sys; sys.path.insert(0, '/app'); \
+from src.chatterbox.mtl_tts import ChatterboxMultilingualTTS; \
+print('Downloading Chatterbox Multilingual model weights...'); \
+model = ChatterboxMultilingualTTS.from_pretrained('cpu'); \
+print('Model downloaded and cached successfully!'); \
+del model \
+"
 
-RUN pip3 install --no-cache-dir \
-    git+https://github.com/QwenLM/Qwen3-TTS.git
-
+# ─── Copy handler ─────────────────────────────────────────────────────────────
 COPY handler.py .
 
-CMD ["python3", "handler.py"]
+CMD ["python", "-u", "handler.py"]
