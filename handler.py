@@ -18,6 +18,12 @@ from src.chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGE
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[FlashTTS] Running on: {DEVICE}")
 
+# ─── Cache dir — use RunPod Network Volume if mounted, else local ─────────────
+CACHE_DIR = "/runpod-volume/hf_cache" if os.path.exists("/runpod-volume") else "/app/hf_cache"
+os.environ["HF_HOME"] = CACHE_DIR
+os.makedirs(CACHE_DIR, exist_ok=True)
+print(f"[FlashTTS] Model cache dir: {CACHE_DIR}")
+
 # ─── Load model ONCE at worker startup (global scope) ─────────────────────────
 # Model is already baked into Docker image — no download needed
 print("[FlashTTS] Loading ChatterboxMultilingualTTS model...")
