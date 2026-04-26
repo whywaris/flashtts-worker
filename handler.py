@@ -1,110 +1,68 @@
-import sys
 import os
 import io
+import sys
 import base64
+import tempfile
 import traceback
 
-# ─── Path setup — add space to import path ────────────────────────────────────
-SPACE_DIR = "/app/space"
-sys.path.insert(0, SPACE_DIR)
-sys.path.insert(0, "/app")
+import runpod
+import torch
+import numpy as np
+import scipy.io.wavfile as wav_writer
 
-# ─── Cache dir setup BEFORE any model imports ─────────────────────────────────
+# ─── Cache dir ────────────────────────────────────────────────────────────────
 CACHE_DIR = "/runpod-volume/hf_cache" if os.path.exists("/runpod-volume") else "/app/hf_cache"
 os.environ["HF_HOME"] = CACHE_DIR
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-import runpod
-import numpy as np
-import torch
-import scipy.io.wavfile as wav_writer
-
-# ─── Device ───────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[FlashTTS] Device: {DEVICE}")
 print(f"[FlashTTS] Cache: {CACHE_DIR}")
-print(f"[FlashTTS] Python path: {sys.path[:3]}")
 
-# ─── Auto-detect which TTS class to use ───────────────────────────────────────
-MODEL = None
-SUPPORTED_LANGUAGES = {"en": "English"}
-USE_MULTILINGUAL = False
-
-def load_model():
-    global MODEL, SUPPORTED_LANGUAGES, USE_MULTILINGUAL
-
-    # Try multilingual first
-    try:
-        print("[FlashTTS] Trying ChatterboxMultilingualTTS...")
-        # Check what files exist in space
-        for root, dirs, files in os.walk(SPACE_DIR):
-            for f in files:
-                if f.endswith('.py'):
-                    print(f"  Found: {os.path.join(root, f)}")
-
-        from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES as LANGS
-        MODEL = ChatterboxMultilingualTTS.from_pretrained(DEVICE)
-        SUPPORTED_LANGUAGES = LANGS
-        USE_MULTILINGUAL = True
-        print(f"[FlashTTS] Multilingual model loaded! Languages: {list(LANGS.keys())}")
-        return
-    except Exception as e:
-        print(f"[FlashTTS] Multilingual failed: {e}")
-
-    # Fallback to standard Chatterbox
-    try:
-        print("[FlashTTS] Falling back to standard ChatterboxTTS...")
-        from chatterbox.tts import ChatterboxTTS
-        MODEL = ChatterboxTTS.from_pretrained(DEVICE)
-        USE_MULTILINGUAL = False
-        print("[FlashTTS] Standard Chatterbox loaded!")
-        return
-    except Exception as e:
-        print(f"[FlashTTS] Standard also failed: {e}")
-        print(traceback.format_exc())
-
-print("[FlashTTS] Loading model...")
-load_model()
-
-if MODEL is None:
-    print("[FlashTTS] CRITICAL: No model loaded!")
+# ─── Load F5-TTS model ONCE ───────────────────────────────────────────────────
+print("[FlashTTS] Loading F5-TTS model...")
+try:
+    from f5_tts.api import F5TTS
+    MODEL = F5TTS(device=DEVICE)
+    print("[FlashTTS] F5-TTS model loaded successfully!")
+except Exception as e:
+    print(f"[FlashTTS] CRITICAL: Model load failed — {e}")
+    print(traceback.format_exc())
+    MODEL = None
 
 
 # ─── Audio encoding ───────────────────────────────────────────────────────────
 def wav_to_base64(sample_rate: int, audio_np: np.ndarray) -> str:
-    audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+    # Normalize
+    if audio_np.dtype != np.int16:
+        audio_np = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
     buf = io.BytesIO()
-    wav_writer.write(buf, sample_rate, audio_int16)
+    wav_writer.write(buf, sample_rate, audio_np)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("utf-8")
 
 
-# ─── Text chunking ────────────────────────────────────────────────────────────
-def chunk_text(text: str, max_chars: int = 280) -> list:
-    if len(text) <= max_chars:
-        return [text]
-    import re
-    sentences = re.split(r'(?<=[.!?।۔])\s+', text)
-    chunks, current = [], ""
-    for s in sentences:
-        if len(current) + len(s) + 1 <= max_chars:
-            current = (current + " " + s).strip()
-        else:
-            if current:
-                chunks.append(current)
-            current = s if len(s) <= max_chars else ""
-            if len(s) > max_chars:
-                for i in range(0, len(s), max_chars):
-                    chunks.append(s[i:i+max_chars])
-    if current:
-        chunks.append(current)
-    return chunks or [text]
-
-
 # ─── Handler ──────────────────────────────────────────────────────────────────
 def handler(job: dict) -> dict:
+    """
+    Input schema:
+    {
+        "text": str,                      # required — text to synthesize (max 3000 chars)
+        "ref_audio_base64": str,          # optional — reference voice as base64 WAV/MP3
+        "ref_text": str,                  # optional — transcript of reference audio
+        "speed": float,                   # optional — 0.5–2.0 (default: 1.0)
+        "seed": int                       # optional — 0 = random
+    }
+
+    Output:
+    {
+        "audio_base64": str,
+        "sample_rate": int,
+        "characters_processed": int
+    }
+    """
     if MODEL is None:
-        return {"error": "Model not loaded. Check worker logs for details."}
+        return {"error": "Model not loaded. Check worker logs."}
 
     job_input = job.get("input", {})
     text = job_input.get("text", "").strip()
@@ -114,73 +72,59 @@ def handler(job: dict) -> dict:
     if len(text) > 3000:
         return {"error": f"Text too long ({len(text)} chars). Max 3000."}
 
-    language_id  = job_input.get("language_id", "en")
-    exaggeration = float(job_input.get("exaggeration", 0.5))
-    temperature  = float(job_input.get("temperature", 0.8))
-    cfg_weight   = float(job_input.get("cfg_weight", 0.5))
-    seed         = int(job_input.get("seed", 0))
+    speed = float(job_input.get("speed", 1.0))
+    seed  = int(job_input.get("seed", 0))
 
     if seed != 0:
         torch.manual_seed(seed)
         if DEVICE == "cuda":
             torch.cuda.manual_seed_all(seed)
 
-    # Reference audio
-    audio_prompt_path = None
-    if job_input.get("audio_prompt_base64"):
+    # ─── Reference audio (voice cloning) ──────────────────────────────────────
+    ref_audio_path = None
+    ref_text = job_input.get("ref_text", "")
+
+    if job_input.get("ref_audio_base64"):
         try:
-            tmp = "/tmp/ref_audio.wav"
-            with open(tmp, "wb") as f:
-                f.write(base64.b64decode(job_input["audio_prompt_base64"]))
-            audio_prompt_path = tmp
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.write(base64.b64decode(job_input["ref_audio_base64"]))
+            tmp.close()
+            ref_audio_path = tmp.name
+            print(f"[FlashTTS] Reference audio saved: {ref_audio_path}")
         except Exception as e:
             print(f"[FlashTTS] ref audio decode failed: {e}")
 
-    chunks = chunk_text(text)
-    print(f"[FlashTTS] Generating {len(chunks)} chunk(s) | lang={language_id}")
+    print(f"[FlashTTS] Generating | chars={len(text)} | voice_clone={ref_audio_path is not None}")
 
     try:
-        all_audio = []
-        for i, chunk in enumerate(chunks):
-            print(f"[FlashTTS] Chunk {i+1}/{len(chunks)}")
+        wav, sample_rate, _ = MODEL.infer(
+            ref_file=ref_audio_path,
+            ref_text=ref_text,
+            gen_text=text,
+            speed=speed,
+        )
 
-            if USE_MULTILINGUAL:
-                kwargs = {
-                    "language_id": language_id,
-                    "exaggeration": exaggeration,
-                    "temperature": temperature,
-                    "cfg_weight": cfg_weight,
-                }
-                if audio_prompt_path:
-                    kwargs["audio_prompt_path"] = audio_prompt_path
-                wav = MODEL.generate(chunk, **kwargs)
-            else:
-                # Standard chatterbox (English only)
-                kwargs = {
-                    "exaggeration": exaggeration,
-                    "temperature": temperature,
-                    "cfg_weight": cfg_weight,
-                }
-                if audio_prompt_path:
-                    kwargs["audio_prompt_path"] = audio_prompt_path
-                wav = MODEL.generate(chunk, **kwargs)
+        # wav is numpy array from F5-TTS
+        if isinstance(wav, torch.Tensor):
+            wav = wav.squeeze().cpu().numpy()
 
-            all_audio.append(wav.squeeze(0).numpy())
+        audio_b64 = wav_to_base64(sample_rate, wav)
 
-        final_audio = np.concatenate(all_audio, axis=0)
-        audio_b64 = wav_to_base64(MODEL.sr, final_audio)
+        # Cleanup temp file
+        if ref_audio_path and os.path.exists(ref_audio_path):
+            os.unlink(ref_audio_path)
 
         return {
             "audio_base64": audio_b64,
-            "sample_rate": MODEL.sr,
-            "language": language_id,
-            "multilingual": USE_MULTILINGUAL,
+            "sample_rate": sample_rate,
             "characters_processed": len(text)
         }
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[FlashTTS] Generation error:\n{tb}")
+        if ref_audio_path and os.path.exists(ref_audio_path):
+            os.unlink(ref_audio_path)
         return {"error": str(e), "traceback": tb}
 
 
