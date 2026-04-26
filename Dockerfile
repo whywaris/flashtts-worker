@@ -9,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ─── System deps ──────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3.11-dev python3-pip \
-    git ffmpeg libsndfile1 curl \
+    git ffmpeg libsndfile1 curl build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
@@ -17,26 +17,53 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
 
 WORKDIR /app
 
-# ─── Python deps ──────────────────────────────────────────────────────────────
-COPY requirements.txt .
+# ─── Step 1: PyTorch first (heavy, separate layer) ────────────────────────────
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir \
+    torch==2.3.0 torchaudio==2.3.0 \
+    --extra-index-url https://download.pytorch.org/whl/cu121
 
-# ─── Clone HF Space source (contains ChatterboxMultilingualTTS class) ─────────
-RUN git clone https://huggingface.co/spaces/ResembleAI/Chatterbox-Multilingual-TTS /tmp/chatterbox_space && \
-    cp -r /tmp/chatterbox_space/src /app/src && \
-    rm -rf /tmp/chatterbox_space
+# ─── Step 2: Core deps ────────────────────────────────────────────────────────
+RUN pip install --no-cache-dir \
+    runpod>=1.7.0 \
+    numpy==1.26.0 \
+    resampy==0.4.3 \
+    librosa==0.10.0 \
+    transformers==4.46.3 \
+    diffusers==0.29.0 \
+    omegaconf==2.3.0 \
+    safetensors \
+    huggingface_hub \
+    scipy \
+    soundfile \
+    conformer==0.3.2
 
-# ─── Pre-download model weights at BUILD TIME (baked into image) ──────────────
-# This eliminates cold-start model download entirely
+# ─── Step 3: Resemble deps ────────────────────────────────────────────────────
+RUN pip install --no-cache-dir \
+    s3tokenizer \
+    resemble-perth==1.0.1 \
+    silero-vad==5.1.2
+
+# ─── Step 4: Language-specific deps (optional, non-fatal) ────────────────────
+RUN pip install --no-cache-dir spacy_pkuseg pykakasi>=2.2.0 || true
+
+RUN pip install --no-cache-dir \
+    "russian-text-stresser @ git+https://github.com/Vuizur/add-stress-to-epub" || \
+    echo "russian-text-stresser skipped — Russian stress optional"
+
+# ─── Step 5: Clone HF Space source ───────────────────────────────────────────
+RUN git clone https://huggingface.co/spaces/ResembleAI/Chatterbox-Multilingual-TTS /tmp/cb_space && \
+    cp -r /tmp/cb_space/src /app/src && \
+    rm -rf /tmp/cb_space
+
+# ─── Step 6: Pre-bake model weights ──────────────────────────────────────────
 RUN python -c "\
 import sys; sys.path.insert(0, '/app'); \
 from src.chatterbox.mtl_tts import ChatterboxMultilingualTTS; \
-print('Downloading Chatterbox Multilingual model weights...'); \
+print('Downloading model weights...'); \
 model = ChatterboxMultilingualTTS.from_pretrained('cpu'); \
-print('Model downloaded and cached successfully!'); \
-del model \
-"
+print('Done!'); \
+del model"
 
 # ─── Copy handler ─────────────────────────────────────────────────────────────
 COPY handler.py .
